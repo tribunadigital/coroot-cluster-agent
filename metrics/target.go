@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/config"
@@ -150,10 +151,17 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 		t.stop = func() {}
 
 	case TargetTypeMongodb:
+		tlsParam := t.Params["tls"]
+		if tlsParam == "" {
+			tlsParam = "false"
+		}
+		nodeName := t.extractNodeName()
 		collector := mongo.New(
 			t.Addr,
 			credentials.Username,
 			credentials.Password,
+			tlsParam,
+			nodeName,
 			collectTimeout,
 			t.logger,
 		)
@@ -280,6 +288,9 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 				UsernameKey: pod.Annotations["coroot.com/mongodb-scrape-credentials-secret-username-key"],
 				PasswordKey: pod.Annotations["coroot.com/mongodb-scrape-credentials-secret-password-key"],
 			},
+			Params: map[string]string{
+				"tls": pod.Annotations["coroot.com/mongodb-scrape-param-tls"],
+			},
 		}
 	}
 
@@ -297,4 +308,23 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 	}
 
 	return t
+}
+
+func (t *Target) extractNodeName() string {
+	if strings.Contains(t.Description, "node=") {
+		nodePrefix := "node="
+		start := strings.Index(t.Description, nodePrefix)
+		if start != -1 {
+			start += len(nodePrefix)
+			end := strings.Index(t.Description[start:], ")")
+			if end == -1 {
+				end = strings.Index(t.Description[start:], " ")
+			}
+			if end == -1 {
+				end = len(t.Description) - start
+			}
+			return t.Description[start : start+end]
+		}
+	}
+	return ""
 }
