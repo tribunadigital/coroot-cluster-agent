@@ -100,6 +100,7 @@ func customResourceConfig() string {
 	resources := append(fluxcd(), argocd()...)
 	resources = append(resources, cnpg()...)
 	resources = append(resources, perconaPG()...)
+	resources = append(resources, psmdb()...)
 	cfg := crs.Metrics{
 		Spec: crs.MetricsSpec{Resources: resources},
 	}

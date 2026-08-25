@@ -2,7 +2,6 @@ package mysql
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	"github.com/coroot/coroot-cluster-agent/common"
@@ -121,13 +120,8 @@ func (c *Collector) queryMetrics(ch chan<- prometheus.Metric, n int) {
 		}
 		withKeys = append(withKeys, statsWithKey{k: k, s: s})
 	}
-	sort.Slice(withKeys, func(i, j int) bool {
-		return withKeys[i].s.totalTimePerSecond > withKeys[j].s.totalTimePerSecond
-	})
-	if n > len(withKeys) {
-		n = len(withKeys)
-	}
-	for _, i := range withKeys[:n] {
+	withKeys = common.TopN(withKeys, n, func(a, b statsWithKey) bool { return a.s.totalTimePerSecond > b.s.totalTimePerSecond })
+	for _, i := range withKeys {
 		ch <- common.Gauge(dQueryCalls, i.s.callsPerSecond, i.k.schema, i.k.query)
 		ch <- common.Gauge(dQueryTotalTime, i.s.totalTimePerSecond, i.k.schema, i.k.query)
 		ch <- common.Gauge(dQueryLockTime, i.s.lockTimePerSecond, i.k.schema, i.k.query)

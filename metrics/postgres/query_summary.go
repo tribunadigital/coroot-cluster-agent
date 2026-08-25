@@ -1,7 +1,6 @@
 package postgres
 
 import (
-	"sort"
 	"time"
 )
 
@@ -62,28 +61,4 @@ func (s *QuerySummary) updateFromStatStatements(cur, prev ssRow) {
 	s.Queries += callsDelta
 	s.TotalTime += totalTimeDelta
 	s.IOTime += ioTimeDelta
-}
-
-type summaryWithKey struct {
-	key     QueryKey
-	last    float64
-	summary *QuerySummary
-}
-
-func top(all map[QueryKey]*QuerySummary, n int) map[QueryKey]*QuerySummary {
-	withKeys := make([]summaryWithKey, 0, len(all))
-	for k, s := range all {
-		withKeys = append(withKeys, summaryWithKey{key: k, summary: s, last: s.TotalTime})
-	}
-	sort.Slice(withKeys, func(i, j int) bool {
-		return withKeys[i].last > withKeys[j].last
-	})
-	if n > len(withKeys) {
-		n = len(withKeys)
-	}
-	res := make(map[QueryKey]*QuerySummary, n)
-	for _, i := range withKeys[:n] {
-		res[i.key] = i.summary
-	}
-	return res
 }

@@ -19,7 +19,7 @@ require (
 	github.com/go-sql-driver/mysql v1.8.1
 	github.com/google/pprof v0.0.0-20241029153458-d1b30febd7db
 	github.com/gorilla/mux v1.8.1
-	github.com/lib/pq v1.10.7
+	github.com/lib/pq v1.12.3
 	github.com/oliver006/redis_exporter v1.61.0
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/prometheus/client_golang v1.23.2
