@@ -76,14 +76,20 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 		var tables []dbtracker.TableSizeEntry
 
 		for _, collName := range collNames {
+			if strings.HasPrefix(collName, "system.") {
+				continue
+			}
 			if dt.trackSizes {
-				size, err := collTotalSize(ctx, database, collName)
+				stats, err := collStorage(ctx, database, collName)
 				if err != nil {
 					dt.logger.Warning("collStats for", db.Name+"."+collName+":", err)
 				} else {
 					tables = append(tables, dbtracker.TableSizeEntry{
-						TableKey: schema.TableKey{DB: db.Name, Table: collName},
-						Size:     size,
+						TableKey:    schema.TableKey{DB: db.Name, Table: collName},
+						Size:        stats.TotalSize,
+						StorageSize: stats.StorageSize,
+						FreeStorage: stats.FreeStorageSize,
+						Documents:   stats.Count,
 					})
 				}
 			}
@@ -106,15 +112,35 @@ func (dt *databaseTracker) collectSnapshot(ctx context.Context) (schema.Snapshot
 	return snapshot, dbSizes, nil
 }
 
-func collTotalSize(ctx context.Context, database *mongo.Database, collName string) (float64, error) {
-	var stats struct {
-		TotalSize float64 `bson:"totalSize"`
+type collStorageStatsRaw struct {
+	Size            float64 `bson:"size"`
+	StorageSize     float64 `bson:"storageSize"`
+	FreeStorageSize float64 `bson:"freeStorageSize"`
+	TotalSize       float64 `bson:"totalSize"`
+	Count           float64 `bson:"count"`
+}
+
+func collStorage(ctx context.Context, database *mongo.Database, collName string) (*collStorageStatsRaw, error) {
+	cursor, err := database.Collection(collName).Aggregate(ctx, bson.A{
+		bson.D{{Key: "$collStats", Value: bson.D{{Key: "storageStats", Value: bson.D{}}}}},
+	})
+	if err != nil {
+		return nil, err
 	}
-	res := database.RunCommand(ctx, bson.D{{Key: "collStats", Value: collName}})
-	if err := res.Decode(&stats); err != nil {
-		return 0, err
+	defer cursor.Close(ctx)
+	var doc struct {
+		StorageStats collStorageStatsRaw `bson:"storageStats"`
 	}
-	return stats.TotalSize, nil
+	if !cursor.Next(ctx) {
+		if err = cursor.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("no $collStats result")
+	}
+	if err = cursor.Decode(&doc); err != nil {
+		return nil, err
+	}
+	return &doc.StorageStats, nil
 }
 
 func indexSnapshot(ctx context.Context, coll *mongo.Collection) (string, error) {

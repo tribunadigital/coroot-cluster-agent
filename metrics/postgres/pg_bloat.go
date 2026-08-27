@@ -3,8 +3,8 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"sort"
 
+	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/logger"
 )
 
@@ -73,7 +73,7 @@ func collectBloat(ctx context.Context, db *sql.DB, log logger.Logger) *dbBloat {
 		}
 		rows.Close()
 	}
-	b.TopTables = topBloat(b.TopTables)
+	b.TopTables = common.TopN(b.TopTables, bloatTopN, func(a, b bloatEntry) bool { return a.Bytes > b.Bytes })
 
 	if rows, err := db.QueryContext(ctx, indexBloatQuery); err != nil {
 		log.Warning("index bloat estimation:", err)
@@ -91,15 +91,7 @@ func collectBloat(ctx context.Context, db *sql.DB, log logger.Logger) *dbBloat {
 		}
 		rows.Close()
 	}
-	b.TopIndexes = topBloat(b.TopIndexes)
+	b.TopIndexes = common.TopN(b.TopIndexes, bloatTopN, func(a, b bloatEntry) bool { return a.Bytes > b.Bytes })
 
 	return b
-}
-
-func topBloat(entries []bloatEntry) []bloatEntry {
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Bytes > entries[j].Bytes })
-	if len(entries) > bloatTopN {
-		entries = entries[:bloatTopN]
-	}
-	return entries
 }

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/config"
 	"github.com/coroot/coroot-cluster-agent/k8s"
 	"github.com/coroot/coroot-cluster-agent/metrics/mongo"
@@ -17,6 +18,8 @@ import (
 	"github.com/coroot/coroot-cluster-agent/schema/emitter"
 	"github.com/coroot/logger"
 	"github.com/go-kit/log/level"
+	gomysql "github.com/go-sql-driver/mysql"
+	"github.com/lib/pq"
 	redis "github.com/oliver006/redis_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
 	memcached "github.com/prometheus/memcached_exporter/pkg/exporter"
@@ -44,11 +47,20 @@ type CredentialsSecret struct {
 	PasswordKey string
 }
 
+type TLSSecret struct {
+	Namespace string
+	Name      string
+	CAKey     string
+	CertKey   string
+	KeyKey    string
+}
+
 type Target struct {
 	Type              TargetType
 	Addr              string
 	Credentials       Credentials
 	CredentialsSecret CredentialsSecret
+	TLSSecret         TLSSecret
 	Params            map[string]string
 
 	Description                  string
@@ -64,6 +76,7 @@ func (t *Target) Equal(other *Target) bool {
 		t.Addr == other.Addr &&
 		t.Credentials == other.Credentials &&
 		t.CredentialsSecret == other.CredentialsSecret &&
+		t.TLSSecret == other.TLSSecret &&
 		maps.Equal(t.Params, other.Params)
 }
 
@@ -91,11 +104,12 @@ func (t *Target) IsExporterStarted() bool {
 	return t.coll != nil
 }
 
-func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials, scrapeInterval, scrapeTimeout time.Duration, changeEmitter *emitter.ChangeEmitter, maxTablesPerDB int, trackSizes, trackBloat bool, excludeDatabases []string) error {
+func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials, tlsCreds common.TLSCredentials, scrapeInterval, scrapeTimeout time.Duration, changeEmitter *emitter.ChangeEmitter, maxTablesPerDB int, trackSizes, trackBloat bool, excludeDatabases []string) error {
 	collectTimeout := scrapeTimeout - time.Second
 	if collectTimeout <= 0 {
 		collectTimeout = time.Second
 	}
+	caCert := tlsCreds.CA
 	switch t.Type {
 
 	case TargetTypePostgres:
@@ -104,6 +118,18 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 		query.Set("connect_timeout", "1")
 		query.Set("statement_timeout", strconv.Itoa(int(collectTimeout.Milliseconds())))
 		sslmode := t.Params["sslmode"]
+		pqTLSName := ""
+		if tlsCreds.CA != "" || (tlsCreds.Cert != "" && tlsCreds.Key != "") {
+			cfg, err := common.DatabaseTLSConfig(tlsCreds, false)
+			if err != nil {
+				return err
+			}
+			pqTLSName = "coroot-" + t.Addr
+			if err = pq.RegisterTLSConfig(pqTLSName, cfg); err != nil {
+				return err
+			}
+			sslmode = "pqgo-" + pqTLSName
+		}
 		if sslmode == "" {
 			sslmode = "disable"
 		}
@@ -111,28 +137,56 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 		dsn := fmt.Sprintf("postgresql://%s@%s/postgres?%s", userPass, t.Addr, query.Encode())
 		collector, err := postgres.New(dsn, scrapeInterval, collectTimeout, t.logger, changeEmitter, t.Addr, maxTablesPerDB, trackSizes, trackBloat, excludeDatabases)
 		if err != nil {
+			if pqTLSName != "" {
+				_ = pq.RegisterTLSConfig(pqTLSName, nil)
+			}
 			return err
 		}
 		t.coll = collector
-		t.stop = func() { _ = collector.Close() }
+		t.stop = func() {
+			_ = collector.Close()
+			if pqTLSName != "" {
+				_ = pq.RegisterTLSConfig(pqTLSName, nil)
+			}
+		}
 
 	case TargetTypeMysql:
 		userPass := fmt.Sprintf("%s:%s", credentials.Username, credentials.Password)
 		query := url.Values{}
 		query.Set("timeout", fmt.Sprintf("%dms", collectTimeout.Milliseconds()))
-		tls := t.Params["tls"]
-		if tls == "" {
-			tls = "false"
+		tlsParam := t.Params["tls"]
+		tlsConfigName := ""
+		if (caCert != "" || (tlsCreds.Cert != "" && tlsCreds.Key != "")) && tlsParam != "false" {
+			cfg, err := common.DatabaseTLSConfig(tlsCreds, tlsParam == "skip-verify")
+			if err != nil {
+				return err
+			}
+			tlsConfigName = "coroot-" + t.Addr
+			if err = gomysql.RegisterTLSConfig(tlsConfigName, cfg); err != nil {
+				return err
+			}
+			tlsParam = tlsConfigName
 		}
-		query.Set("tls", tls)
+		if tlsParam == "" {
+			tlsParam = "false"
+		}
+		query.Set("tls", tlsParam)
 		dsn := fmt.Sprintf("%s@tcp(%s)/?%s", userPass, t.Addr, query.Encode())
 		collector, err := mysql.New(dsn, t.logger, scrapeInterval, collectTimeout,
 			changeEmitter, t.Addr, maxTablesPerDB, trackSizes, excludeDatabases)
 		if err != nil {
+			if tlsConfigName != "" {
+				gomysql.DeregisterTLSConfig(tlsConfigName)
+			}
 			return err
 		}
 		t.coll = collector
-		t.stop = func() { _ = collector.Close() }
+		t.stop = func() {
+			_ = collector.Close()
+			if tlsConfigName != "" {
+				gomysql.DeregisterTLSConfig(tlsConfigName)
+			}
+		}
 
 	case TargetTypeRedis:
 		dsn := fmt.Sprintf("redis://%s", t.Addr)
@@ -156,6 +210,8 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 			t.Addr,
 			credentials.Username,
 			credentials.Password,
+			tlsCreds,
+			t.Params,
 			scrapeInterval,
 			collectTimeout,
 			t.logger,
@@ -230,6 +286,7 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 				UsernameKey: pod.Annotations["coroot.com/postgres-scrape-credentials-secret-username-key"],
 				PasswordKey: pod.Annotations["coroot.com/postgres-scrape-credentials-secret-password-key"],
 			},
+			TLSSecret: tlsSecretFromPod(pod, "postgres"),
 			Params: map[string]string{
 				"sslmode": pod.Annotations["coroot.com/postgres-scrape-param-sslmode"],
 			},
@@ -250,6 +307,7 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 				UsernameKey: pod.Annotations["coroot.com/mysql-scrape-credentials-secret-username-key"],
 				PasswordKey: pod.Annotations["coroot.com/mysql-scrape-credentials-secret-password-key"],
 			},
+			TLSSecret: tlsSecretFromPod(pod, "mysql"),
 			Params: map[string]string{
 				"tls": pod.Annotations["coroot.com/mysql-scrape-param-tls"],
 			},
@@ -287,6 +345,11 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 				UsernameKey: pod.Annotations["coroot.com/mongodb-scrape-credentials-secret-username-key"],
 				PasswordKey: pod.Annotations["coroot.com/mongodb-scrape-credentials-secret-password-key"],
 			},
+			TLSSecret: tlsSecretFromPod(pod, "mongodb"),
+			Params: map[string]string{
+				"tls":        pod.Annotations["coroot.com/mongodb-scrape-param-tls"],
+				"authSource": pod.Annotations["coroot.com/mongodb-scrape-param-auth-source"],
+			},
 		}
 	}
 
@@ -304,4 +367,18 @@ func TargetFromPod(pod *k8s.Pod) *Target {
 	}
 
 	return t
+}
+
+func tlsSecretFromPod(pod *k8s.Pod, targetType string) TLSSecret {
+	name := pod.Annotations["coroot.com/"+targetType+"-scrape-tls-secret-name"]
+	if name == "" {
+		return TLSSecret{}
+	}
+	return TLSSecret{
+		Namespace: pod.Id.Namespace,
+		Name:      name,
+		CAKey:     pod.Annotations["coroot.com/"+targetType+"-scrape-tls-secret-ca-key"],
+		CertKey:   pod.Annotations["coroot.com/"+targetType+"-scrape-tls-secret-cert-key"],
+		KeyKey:    pod.Annotations["coroot.com/"+targetType+"-scrape-tls-secret-key-key"],
+	}
 }

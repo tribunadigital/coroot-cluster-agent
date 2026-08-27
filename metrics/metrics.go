@@ -2,11 +2,13 @@ package metrics
 
 import (
 	"errors"
+
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
+	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/config"
 	"github.com/coroot/coroot-cluster-agent/flags"
 	"github.com/coroot/coroot-cluster-agent/k8s"
@@ -168,6 +170,14 @@ func (ms *Metrics) startExporters() {
 					id2Keys[secretId{namespace: s.Namespace, name: s.Name}] = keys
 				}
 			}
+			if s := t.TLSSecret; s.Name != "" {
+				id := secretId{namespace: s.Namespace, name: s.Name}
+				for _, key := range []string{s.CAKey, s.CertKey, s.KeyKey} {
+					if key != "" {
+						id2Keys[id] = append(id2Keys[id], key)
+					}
+				}
+			}
 		}
 		var err error
 		secrets := map[secretId]map[string]string{}
@@ -211,7 +221,39 @@ func (ms *Metrics) startExporters() {
 					}
 				}
 			}
-			if err := t.StartExporter(ms.reg, credentials, ms.scrapeInterval, ms.scrapeTimeout, ms.changeEmitter, *flags.MaxTablesPerDatabase, *flags.TrackDatabaseSizes, *flags.TrackDatabaseBloat, *flags.ExcludeDatabases); err != nil {
+			var tlsCreds common.TLSCredentials
+			if s := t.TLSSecret; s.Name != "" {
+				kv := secrets[secretId{namespace: s.Namespace, name: s.Name}]
+				switch {
+				case isSecretsForbidden:
+					t.logger.Errorf("failed to start exporter: secret '%s' forbidden", s.Name)
+					continue
+				case kv == nil:
+					t.logger.Errorf("failed to start exporter: TLS secret '%s' not found", s.Name)
+					continue
+				default:
+					if (s.CertKey != "") != (s.KeyKey != "") {
+						t.logger.Errorf("failed to start exporter: TLS secret '%s': the cert and key keys must be set together", s.Name)
+						continue
+					}
+					if s.CAKey == "" && s.CertKey == "" {
+						t.logger.Errorf("failed to start exporter: TLS secret '%s': no keys specified (set the ca-key and/or cert-key/key-key annotations)", s.Name)
+						continue
+					}
+					if s.CAKey != "" {
+						tlsCreds.CA = kv[s.CAKey]
+					}
+					if s.CertKey != "" {
+						tlsCreds.Cert = kv[s.CertKey]
+						tlsCreds.Key = kv[s.KeyKey]
+					}
+					if tlsCreds.CA == "" && (tlsCreds.Cert == "" || tlsCreds.Key == "") {
+						t.logger.Errorf("failed to start exporter: TLS secret '%s' does not contain the specified keys", s.Name)
+						continue
+					}
+				}
+			}
+			if err := t.StartExporter(ms.reg, credentials, tlsCreds, ms.scrapeInterval, ms.scrapeTimeout, ms.changeEmitter, *flags.MaxTablesPerDatabase, *flags.TrackDatabaseSizes, *flags.TrackDatabaseBloat, *flags.ExcludeDatabases); err != nil {
 				t.logger.Errorf("failed to start exporter: %s", err)
 				continue
 			}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/blang/semver"
+	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/metrics/dbtracker"
 	"github.com/coroot/logger"
 	_ "github.com/lib/pq"
@@ -111,6 +112,7 @@ type ConnectionKey struct {
 type Collector struct {
 	ctx           context.Context
 	ctxCancelFunc context.CancelFunc
+	done          chan struct{}
 
 	scrapeInterval time.Duration
 	collectTimeout time.Duration
@@ -160,6 +162,7 @@ func New(dsn string, scrapeInterval, collectTimeout time.Duration, logger logger
 		ctx:            ctx,
 		logger:         logger,
 		ctxCancelFunc:  cancelFunc,
+		done:           make(chan struct{}),
 		scrapeErrors:   map[string]bool{},
 		scrapeInterval: scrapeInterval,
 		collectTimeout: collectTimeout,
@@ -182,6 +185,7 @@ func New(dsn string, scrapeInterval, collectTimeout time.Duration, logger logger
 		c.logger.Warning("probe failed:", err)
 	}
 	go func() {
+		defer close(c.done)
 		ticker := time.NewTicker(scrapeInterval)
 		c.snapshot()
 		for {
@@ -399,7 +403,7 @@ func (c *Collector) queryMetrics(ch chan<- prometheus.Metric) {
 		ch <- gauge(dDbQueries, queries/interval.Seconds(), db)
 	}
 
-	for k, summary := range top(summaries, topQueriesN) {
+	for k, summary := range common.TopNMap(summaries, topQueriesN, func(s *QuerySummary) float64 { return s.TotalTime }) {
 		ch <- gauge(dTopQueryCalls, summary.Queries/interval.Seconds(), k.DB, k.User, k.Query)
 		ch <- gauge(dTopQueryTime, summary.TotalTime/interval.Seconds(), k.DB, k.User, k.Query)
 		ch <- gauge(dTopQueryIOTime, summary.IOTime/interval.Seconds(), k.DB, k.User, k.Query)
@@ -472,6 +476,7 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 
 func (c *Collector) Close() error {
 	c.ctxCancelFunc()
+	<-c.done
 	return c.db.Close()
 }
 

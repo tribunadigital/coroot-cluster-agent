@@ -2,9 +2,9 @@ package dbtracker
 
 import (
 	"context"
-	"sort"
 	"time"
 
+	"github.com/coroot/coroot-cluster-agent/common"
 	"github.com/coroot/coroot-cluster-agent/schema"
 	"github.com/coroot/logger"
 )
@@ -20,7 +20,10 @@ type ChangeEmitter interface {
 
 type TableSizeEntry struct {
 	schema.TableKey
-	Size float64
+	Size        float64
+	StorageSize float64
+	FreeStorage float64
+	Documents   float64
 }
 
 type TableGrowthEntry struct {
@@ -105,11 +108,7 @@ func (t *Tracker) computeTableGrowth(dbSizes map[string]*DBSizeSnapshot, elapsed
 				}
 			}
 		}
-		sort.Slice(all, func(i, j int) bool { return all[i].Growth > all[j].Growth })
-		if len(all) > TopTablesN {
-			all = all[:TopTablesN]
-		}
-		t.TableGrowth = all
+		t.TableGrowth = common.TopN(all, TopTablesN, func(a, b TableGrowthEntry) bool { return a.Growth > b.Growth })
 	}
 	t.prevTableSizes = currSizes
 }
@@ -119,15 +118,12 @@ func trimTopTables(dbSizes map[string]*DBSizeSnapshot, n int) {
 	for _, snap := range dbSizes {
 		all = append(all, snap.Tables...)
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].Size > all[j].Size })
-	if len(all) > n {
-		all = all[:n]
-	}
-	for _, snap := range dbSizes {
-		snap.Tables = nil
-	}
+	all = common.TopN(all, n, func(a, b TableSizeEntry) bool { return a.Size > b.Size })
+	byDB := make(map[string][]TableSizeEntry, len(dbSizes))
 	for _, te := range all {
-		snap := dbSizes[te.DB]
-		snap.Tables = append(snap.Tables, te)
+		byDB[te.DB] = append(byDB[te.DB], te)
+	}
+	for db, snap := range dbSizes {
+		snap.Tables = byDB[db]
 	}
 }
