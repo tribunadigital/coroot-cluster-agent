@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,39 +25,7 @@ const (
 	picoSeconds = 1e12
 )
 
-var (
-	dUp          = common.Desc("mysql_up", "")
-	dScrapeError = common.Desc("mysql_scrape_error", "", "error", "warning")
-	dInfo        = common.Desc("mysql_info", "", "server_version", "server_id", "server_uuid")
-
-	dQueryCalls     = common.Desc("mysql_top_query_calls_per_second", "", "schema", "query")
-	dQueryTotalTime = common.Desc("mysql_top_query_time_per_second", "", "schema", "query")
-	dQueryLockTime  = common.Desc("mysql_top_query_lock_time_per_second", "", "schema", "query")
-
-	dLockedQueries       = common.Desc("mysql_locked_queries", "Number of queries currently waiting for a lock", "schema", "query")
-	dLockAwaitingQueries = common.Desc("mysql_lock_awaiting_queries", "Number of queries currently awaiting a lock, by the blocking query", "schema", "blocking_query")
-
-	dReplicationIORunning  = common.Desc("mysql_replication_io_status", "", "source_server_id", "source_server_uuid", "state", "last_error")
-	dReplicationSQLRunning = common.Desc("mysql_replication_sql_status", "", "source_server_id", "source_server_uuid", "state", "last_error")
-	dReplicationLag        = common.Desc("mysql_replication_lag_seconds", "", "source_server_id", "source_server_uuid")
-
-	dConnectionsMax     = common.Desc("mysql_connections_max", "")
-	dConnectionsCurrent = common.Desc("mysql_connections_current", "")
-	dConnectionsTotal   = common.Desc("mysql_connections_total", "")
-	dConnectionsAborted = common.Desc("mysql_connections_aborted_total", "")
-
-	dBytesReceived = common.Desc("mysql_traffic_received_bytes_total", "")
-	dBytesSent     = common.Desc("mysql_traffic_sent_bytes_total", "")
-
-	dQueries     = common.Desc("mysql_queries_total", "")
-	dSlowQueries = common.Desc("mysql_slow_queries_total", "")
-
-	dIOTime = common.Desc("mysql_top_table_io_wait_time_per_second", "", "schema", "table", "operation")
-
-	dDbSize          = common.Desc("mysql_database_size_bytes", "Total size of the database in bytes", "db")
-	dTableSize       = common.Desc("mysql_table_size_bytes", "Total size of the table in bytes", "db", "table")
-	dTableSizeGrowth = common.Desc("mysql_table_size_growth_bytes_per_second", "Table size growth rate in bytes per second", "db", "table")
-)
+var reVersion = regexp.MustCompile(`^(\d+)\.(\d+)`)
 
 type Collector struct {
 	ctx          context.Context
@@ -72,23 +41,32 @@ type Collector struct {
 	scrapeInterval time.Duration
 	collectTimeout time.Duration
 
-	globalVariables map[string]string
-	globalStatus    map[string]string
-	perfschemaPrev  *statementsSummarySnapshot
-	perfschemaCurr  *statementsSummarySnapshot
-	lockWaits       *lockWaits
-	replicaStatuses []*ReplicaStatus
-	ioByTablePrev   *ioByTableSnapshot
-	ioByTableCurr   *ioByTableSnapshot
+	globalVariables  map[string]string
+	globalStatus     map[string]string
+	perfschemaPrev   *statementsSummarySnapshot
+	perfschemaCurr   *statementsSummarySnapshot
+	activePrev       *activeStatementsSnapshot
+	activeCurr       *activeStatementsSnapshot
+	lockWaits        *lockWaits
+	innodbTrx        *innodbTrx
+	innodbCounters   *innodbCounters
+	binlogStats      *binlogStats
+	groupReplication *groupReplication
+	replicaStatuses  []*ReplicaStatus
+	ioByTablePrev    *ioByTableSnapshot
+	ioByTableCurr    *ioByTableSnapshot
 
-	invalidQueries map[string]bool
+	invalidQueries   map[string]bool
+	excludeDatabases map[string]bool
 
-	dbTracker         *databaseTracker
-	emitter           dbtracker.ChangeEmitter
-	targetAddr        string
-	prevSettingsText  string
-	isMariaDB         bool
-	writableVariables map[string]bool
+	dbTracker          *databaseTracker
+	emitter            dbtracker.ChangeEmitter
+	targetAddr         string
+	prevSettingsText   string
+	isMariaDB          bool
+	isGalera           bool
+	hasUndoTablespaces bool
+	writableVariables  map[string]bool
 }
 
 func New(dsn string, logger logger.Logger, scrapeInterval, collectTimeout time.Duration,
@@ -96,6 +74,10 @@ func New(dsn string, logger logger.Logger, scrapeInterval, collectTimeout time.D
 	trackSizes bool, excludeDatabases []string) (*Collector, error) {
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
+	exclude := make(map[string]bool, len(excludeDatabases))
+	for _, db := range excludeDatabases {
+		exclude[db] = true
+	}
 	c := &Collector{
 		ctx:            ctx,
 		logger:         logger,
@@ -105,9 +87,10 @@ func New(dsn string, logger logger.Logger, scrapeInterval, collectTimeout time.D
 		emitter:        emitter,
 		targetAddr:     targetAddr,
 
-		globalStatus:    map[string]string{},
-		globalVariables: map[string]string{},
-		invalidQueries:  map[string]bool{},
+		globalStatus:     map[string]string{},
+		globalVariables:  map[string]string{},
+		invalidQueries:   map[string]bool{},
+		excludeDatabases: exclude,
 	}
 	var err error
 	c.db, err = sql.Open("mysql", dsn)
@@ -179,12 +162,23 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- common.Gauge(dLockAwaitingQueries, q.count, q.schema, q.query)
 		}
 	}
+	c.innodbTrxMetrics(ch)
 	c.replicationMetrics(ch)
 	c.tableSizeMetrics(ch)
 	metricFromVariable(ch, dConnectionsMax, "max_connections", prometheus.GaugeValue, c.globalVariables)
 	metricFromVariable(ch, dConnectionsCurrent, "Threads_connected", prometheus.GaugeValue, c.globalStatus)
 	metricFromVariable(ch, dConnectionsTotal, "Connections", prometheus.CounterValue, c.globalStatus)
 	metricFromVariable(ch, dConnectionsAborted, "Aborted_connects", prometheus.CounterValue, c.globalStatus)
+	metricFromVariable(ch, dConnectionErrorsMaxConnections, "Connection_errors_max_connections", prometheus.CounterValue, c.globalStatus)
+	metricFromVariable(ch, dThreadsRunning, "Threads_running", prometheus.GaugeValue, c.globalStatus)
+	metricFromVariable(ch, dTmpDiskTables, "Created_tmp_disk_tables", prometheus.CounterValue, c.globalStatus)
+	c.galeraMetrics(ch)
+	c.groupReplicationMetrics(ch)
+	c.innodbMetrics(ch)
+	c.innodbCountersMetrics(ch)
+	c.binlogMetrics(ch)
+	metricFromVariable(ch, dTableLocksWaited, "Table_locks_waited", prometheus.CounterValue, c.globalStatus)
+	metricFromVariable(ch, dTableLocksImmediate, "Table_locks_immediate", prometheus.CounterValue, c.globalStatus)
 	metricFromVariable(ch, dBytesReceived, "Bytes_received", prometheus.CounterValue, c.globalStatus)
 	metricFromVariable(ch, dBytesSent, "Bytes_sent", prometheus.CounterValue, c.globalStatus)
 	metricFromVariable(ch, dQueries, "Questions", prometheus.CounterValue, c.globalStatus)
@@ -213,10 +207,15 @@ func (c *Collector) snapshot() {
 	}
 	c.isUp = true
 	c.isMariaDB = strings.Contains(strings.ToLower(c.globalVariables["version"]), "mariadb")
+	c.hasUndoTablespaces = !c.isMariaDB && versionAtLeast(c.globalVariables["version"], 8, 0)
 	if err := c.updateVariables(ctx, "SHOW GLOBAL STATUS", c.globalStatus); err != nil {
 		c.logger.Warning(err)
 		c.scrapeErrors[err.Error()] = true
 		return
+	}
+	c.isGalera = false
+	if _, ok := c.globalStatus["wsrep_cluster_size"]; ok {
+		c.isGalera = wsrepEnabled(c.globalVariables)
 	}
 	if err := c.updateReplicationStatus(ctx); err != nil {
 		c.logger.Warning(err)
@@ -231,6 +230,12 @@ func (c *Collector) snapshot() {
 		c.scrapeErrors[err.Error()] = true
 		return
 	}
+	c.activePrev = c.activeCurr
+	if c.activeCurr, err = c.queryActiveStatements(ctx, c.activePrev); err != nil {
+		c.logger.Warning(err)
+		c.scrapeErrors[err.Error()] = true
+		c.activeCurr = nil
+	}
 	c.ioByTablePrev = c.ioByTableCurr
 	c.ioByTableCurr, err = c.queryTableIOWaits(ctx)
 	if err != nil {
@@ -240,6 +245,15 @@ func (c *Collector) snapshot() {
 	}
 
 	c.lockWaitsSnapshot(ctx)
+	c.innodbTrxSnapshot(ctx)
+	c.innodbCountersSnapshot(ctx)
+	c.binlogSnapshot(ctx)
+
+	if c.globalVariables["group_replication_group_name"] != "" {
+		c.groupReplicationSnapshot(ctx)
+	} else {
+		c.groupReplication = nil
+	}
 
 	if c.emitter != nil {
 		c.trackSettingsChanges(ctx)
@@ -247,32 +261,6 @@ func (c *Collector) snapshot() {
 	if c.dbTracker != nil {
 		c.dbTracker.Track(ctx, c.emitter, c.targetAddr)
 	}
-}
-
-func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- dUp
-	ch <- dScrapeError
-	ch <- dInfo
-	ch <- dQueryCalls
-	ch <- dQueryTotalTime
-	ch <- dQueryLockTime
-	ch <- dLockedQueries
-	ch <- dLockAwaitingQueries
-	ch <- dReplicationIORunning
-	ch <- dReplicationSQLRunning
-	ch <- dReplicationLag
-	ch <- dConnectionsMax
-	ch <- dConnectionsCurrent
-	ch <- dConnectionsTotal
-	ch <- dConnectionsAborted
-	ch <- dBytesReceived
-	ch <- dBytesSent
-	ch <- dQueries
-	ch <- dSlowQueries
-	ch <- dIOTime
-	ch <- dDbSize
-	ch <- dTableSize
-	ch <- dTableSizeGrowth
 }
 
 func (c *Collector) loadWritableVariableNames(ctx context.Context) error {
@@ -347,12 +335,36 @@ func (c *Collector) tableSizeMetrics(ch chan<- prometheus.Metric) {
 	}
 }
 
-func metricFromVariable(ch chan<- prometheus.Metric, desc *prometheus.Desc, name string, typ prometheus.ValueType, variables map[string]string) {
+func versionAtLeast(version string, major, minor int) bool {
+	m := reVersion.FindStringSubmatch(version)
+	if m == nil {
+		return false
+	}
+	maj, err := strconv.Atoi(m[1])
+	if err != nil {
+		return false
+	}
+	min, err := strconv.Atoi(m[2])
+	if err != nil {
+		return false
+	}
+	return maj > major || (maj == major && min >= minor)
+}
+
+func metricFromVariable(ch chan<- prometheus.Metric, desc *prometheus.Desc, name string, typ prometheus.ValueType, variables map[string]string, convert ...func(float64) float64) bool {
 	v, ok := variables[name]
 	if !ok {
-		return
+		return false
 	}
-	if f, err := strconv.ParseFloat(v, 64); err == nil {
-		ch <- prometheus.MustNewConstMetric(desc, typ, f)
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return false
 	}
+	for _, c := range convert {
+		if c != nil {
+			f = c(f)
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(desc, typ, f)
+	return true
 }

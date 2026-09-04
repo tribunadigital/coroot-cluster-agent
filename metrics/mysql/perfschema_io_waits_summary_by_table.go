@@ -49,9 +49,12 @@ func (c *Collector) queryTableIOWaits(ctx context.Context) (*ioByTableSnapshot, 
 			c.logger.Warning(err)
 			continue
 		}
+		if c.excludeDatabases[k.schema] {
+			continue
+		}
 		snapshot.rows[k] = r
 	}
-	return snapshot, nil
+	return snapshot, rows.Err()
 }
 
 type ioStats struct {

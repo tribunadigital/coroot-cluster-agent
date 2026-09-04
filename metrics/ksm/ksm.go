@@ -101,6 +101,7 @@ func customResourceConfig() string {
 	resources = append(resources, cnpg()...)
 	resources = append(resources, perconaPG()...)
 	resources = append(resources, psmdb()...)
+	resources = append(resources, pxc()...)
 	cfg := crs.Metrics{
 		Spec: crs.MetricsSpec{Resources: resources},
 	}

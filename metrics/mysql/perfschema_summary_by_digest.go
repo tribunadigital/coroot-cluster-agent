@@ -20,6 +20,8 @@ type statementsSummaryRow struct {
 	calls               uint64
 	totalTime           uint64
 	lockTime            uint64
+	rowsExamined        uint64
+	rowsSent            uint64
 }
 
 type digestKey struct {
@@ -41,11 +43,13 @@ func (c *Collector) queryStatementsSummary(ctx context.Context, prev *statements
 	    DIGEST_TEXT,
 	    COUNT_STAR,
 	    SUM_TIMER_WAIT,
-	    SUM_LOCK_TIME
-	FROM 
+	    SUM_LOCK_TIME,
+	    SUM_ROWS_EXAMINED,
+	    SUM_ROWS_SENT
+	FROM
 		performance_schema.events_statements_summary_by_digest
-	WHERE 
-	    DIGEST IS NOT NULL AND 
+	WHERE
+	    DIGEST IS NOT NULL AND
 	    DIGEST_TEXT IS NOT NULL`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
@@ -57,7 +61,7 @@ func (c *Collector) queryStatementsSummary(ctx context.Context, prev *statements
 	for rows.Next() {
 		var k digestKey
 		var r statementsSummaryRow
-		if err := rows.Scan(&k.schema, &k.digest, &digestText, &r.calls, &r.totalTime, &r.lockTime); err != nil {
+		if err := rows.Scan(&k.schema, &k.digest, &digestText, &r.calls, &r.totalTime, &r.lockTime, &r.rowsExamined, &r.rowsSent); err != nil {
 			c.logger.Warning(err)
 			continue
 		}
@@ -71,13 +75,16 @@ func (c *Collector) queryStatementsSummary(ctx context.Context, prev *statements
 		}
 		snapshot.rows[k] = r
 	}
-	return snapshot, nil
+	return snapshot, rows.Err()
 }
 
 type queryStats struct {
-	callsPerSecond     float64
-	totalTimePerSecond float64
-	lockTimePerSecond  float64
+	calls        float64
+	totalTime    float64 // seconds
+	lockTime     float64 // seconds
+	rowsExamined float64
+	rowsSent     float64
+	inflight     bool // has an in-flight contribution (keep even with zero completed calls)
 }
 
 type statsWithKey struct {
@@ -89,42 +96,84 @@ func (c *Collector) queryMetrics(ch chan<- prometheus.Metric, n int) {
 	if c.perfschemaPrev == nil || c.perfschemaCurr == nil {
 		return
 	}
-	res := map[queryKey]*queryStats{}
-
 	interval := c.perfschemaCurr.ts.Sub(c.perfschemaPrev.ts).Seconds()
-
-	for k, s := range c.perfschemaCurr.rows {
-		prev := c.perfschemaPrev.rows[k]
-		qk := queryKey{schema: k.schema, query: s.obfuscatedQueryText}
-
+	if interval <= 0 {
+		return
+	}
+	res := map[queryKey]*queryStats{}
+	getOrCreate := func(qk queryKey) *queryStats {
 		r := res[qk]
 		if r == nil {
 			r = &queryStats{}
 			res[qk] = r
 		}
+		return r
+	}
+
+	for k, s := range c.perfschemaCurr.rows {
+		prev := c.perfschemaPrev.rows[k]
+		r := getOrCreate(queryKey{schema: k.schema, query: s.obfuscatedQueryText})
 		if calls := s.calls - prev.calls; calls > 0 {
-			r.callsPerSecond += float64(calls) / interval
+			r.calls += float64(calls)
 		}
 		if totalTime := s.totalTime - prev.totalTime; totalTime > 0 {
-			r.totalTimePerSecond += float64(totalTime) / picoSeconds / interval
+			r.totalTime += float64(totalTime) / picoSeconds
 		}
 		if lockTime := s.lockTime - prev.lockTime; lockTime > 0 {
-			r.lockTimePerSecond += float64(lockTime) / picoSeconds / interval
+			r.lockTime += float64(lockTime) / picoSeconds
+		}
+		if rowsExamined := s.rowsExamined - prev.rowsExamined; rowsExamined > 0 {
+			r.rowsExamined += float64(rowsExamined)
+		}
+		if rowsSent := s.rowsSent - prev.rowsSent; rowsSent > 0 {
+			r.rowsSent += float64(rowsSent)
+		}
+	}
+
+	if c.activeCurr != nil {
+		for _, st := range c.activeCurr.stmts {
+			d := st.elapsedSec
+			if d > interval {
+				d = interval
+			}
+			if d <= 0 {
+				continue
+			}
+			r := getOrCreate(st.qk)
+			r.totalTime += d
+			r.inflight = true
+		}
+	}
+
+	if c.activePrev != nil && c.activeCurr != nil {
+		for k, st := range c.activePrev.stmts {
+			if _, still := c.activeCurr.stmts[k]; still {
+				continue
+			}
+			r := res[st.qk]
+			if r == nil {
+				continue
+			}
+			if r.totalTime -= st.elapsedSec; r.totalTime < 0 {
+				r.totalTime = 0
+			}
 		}
 	}
 
 	withKeys := make([]statsWithKey, 0, len(res))
 	for k, s := range res {
-		if s.callsPerSecond == 0 {
+		if s.calls == 0 && !s.inflight {
 			continue
 		}
 		withKeys = append(withKeys, statsWithKey{k: k, s: s})
 	}
-	withKeys = common.TopN(withKeys, n, func(a, b statsWithKey) bool { return a.s.totalTimePerSecond > b.s.totalTimePerSecond })
+	withKeys = common.TopN(withKeys, n, func(a, b statsWithKey) bool { return a.s.totalTime > b.s.totalTime })
 	for _, i := range withKeys {
-		ch <- common.Gauge(dQueryCalls, i.s.callsPerSecond, i.k.schema, i.k.query)
-		ch <- common.Gauge(dQueryTotalTime, i.s.totalTimePerSecond, i.k.schema, i.k.query)
-		ch <- common.Gauge(dQueryLockTime, i.s.lockTimePerSecond, i.k.schema, i.k.query)
+		s := i.s
+		ch <- common.Gauge(dQueryCalls, s.calls/interval, i.k.schema, i.k.query)
+		ch <- common.Gauge(dQueryTotalTime, s.totalTime/interval, i.k.schema, i.k.query)
+		ch <- common.Gauge(dQueryLockTime, s.lockTime/interval, i.k.schema, i.k.query)
+		ch <- common.Gauge(dQueryRowsExamined, s.rowsExamined/interval, i.k.schema, i.k.query)
+		ch <- common.Gauge(dQueryRowsSent, s.rowsSent/interval, i.k.schema, i.k.query)
 	}
-
 }
