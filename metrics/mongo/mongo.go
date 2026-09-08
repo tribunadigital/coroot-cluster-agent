@@ -141,10 +141,15 @@ type Collector struct {
 	prevSettingsText string
 }
 
-func New(host, username, password string, tlsCreds common.TLSCredentials, params map[string]string, scrapeInterval, collectTimeout time.Duration,
+func New(host, username, password, sni string, tlsCreds common.TLSCredentials, params map[string]string, scrapeInterval, collectTimeout time.Duration,
 	logger logger.Logger, emitter dbtracker.ChangeEmitter, targetAddr string,
-	maxTablesPerDB int, trackSizes bool) *Collector {
+	maxTablesPerDB int, trackSizes bool) (*Collector, error) {
 
+	switch params["tls"] {
+	case "", "false", "true", "skip-verify":
+	default:
+		return nil, fmt.Errorf("invalid tls param %q: must be one of \"\", \"false\", \"true\", \"skip-verify\"", params["tls"])
+	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	c := &Collector{
 		ctx:            ctx,
@@ -176,14 +181,22 @@ func New(host, username, password string, tlsCreds common.TLSCredentials, params
 			Password:   password,
 		})
 	}
+	if (tlsCreds.Cert == "") != (tlsCreds.Key == "") {
+		cancelFunc()
+		return nil, fmt.Errorf("incomplete client certificate credentials: both cert and key must be provided")
+	}
 	tlsEnabled := params["tls"] == "true" || params["tls"] == "skip-verify" ||
 		tlsCreds.CA != "" || (tlsCreds.Cert != "" && tlsCreds.Key != "")
 	if tlsEnabled {
-		if cfg, err := common.DatabaseTLSConfig(tlsCreds, params["tls"] == "skip-verify"); err != nil {
-			logger.Error("invalid TLS configuration:", err)
-		} else {
-			c.clientOpts.SetTLSConfig(cfg)
+		cfg, err := common.DatabaseTLSConfig(tlsCreds, params["tls"] == "skip-verify")
+		if err != nil {
+			cancelFunc()
+			return nil, err
 		}
+		if sni != "" {
+			cfg.ServerName = sni
+		}
+		c.clientOpts.SetTLSConfig(cfg)
 	}
 	trackSchema := c.emitter != nil
 	if trackSchema || trackSizes {
@@ -202,7 +215,7 @@ func New(host, username, password string, tlsCreds common.TLSCredentials, params
 			}
 		}
 	}()
-	return c
+	return c, nil
 }
 
 func (c *Collector) connectAndPing(ctx context.Context) error {
