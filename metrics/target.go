@@ -62,6 +62,7 @@ type Target struct {
 	Credentials       Credentials
 	CredentialsSecret CredentialsSecret
 	TLSSecret         TLSSecret
+	Sni               string
 	Params            map[string]string
 
 	Description                  string
@@ -78,6 +79,7 @@ func (t *Target) Equal(other *Target) bool {
 		t.Credentials == other.Credentials &&
 		t.CredentialsSecret == other.CredentialsSecret &&
 		t.TLSSecret == other.TLSSecret &&
+		t.Sni == other.Sni &&
 		maps.Equal(t.Params, other.Params)
 }
 
@@ -214,6 +216,7 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 			t.Addr,
 			credentials.Username,
 			credentials.Password,
+			t.Sni,
 			tlsCreds,
 			t.Params,
 			scrapeInterval,
@@ -262,6 +265,7 @@ func TargetFromConfig(i config.ApplicationInstrumentation) *Target {
 			Username: i.Credentials.Username,
 			Password: i.Credentials.Password,
 		},
+		Sni:         i.Sni,
 		Params:      i.Params,
 		Description: i.Instance,
 	}
