@@ -15,9 +15,9 @@ import (
 )
 
 type testCA struct {
-	caPEM  []byte
-	cert   *x509.Certificate
-	key    *ecdsa.PrivateKey
+	caPEM         []byte
+	cert          *x509.Certificate
+	key           *ecdsa.PrivateKey
 	clientCertPEM []byte
 	clientKeyPEM  []byte
 }
@@ -65,9 +65,9 @@ func newTestCA(t *testing.T) *testCA {
 	}
 
 	return &testCA{
-		caPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
-		cert:  caCert,
-		key:   caKey,
+		caPEM:         pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		cert:          caCert,
+		key:           caKey,
 		clientCertPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER}),
 		clientKeyPEM:  pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: mustMarshalECKey(t, clientKey)}),
 	}

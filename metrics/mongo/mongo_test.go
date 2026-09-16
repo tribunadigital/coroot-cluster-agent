@@ -18,10 +18,10 @@ import (
 )
 
 type tlsFixture struct {
-	caPEM       []byte
-	clientPEM   []byte
+	caPEM        []byte
+	clientPEM    []byte
 	clientKeyPEM []byte
-	serverCert  tls.Certificate
+	serverCert   tls.Certificate
 }
 
 func newTLSFixture(t *testing.T) tlsFixture {
