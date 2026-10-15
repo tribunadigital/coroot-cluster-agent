@@ -63,6 +63,7 @@ type Target struct {
 	Credentials       Credentials
 	CredentialsSecret CredentialsSecret
 	TLSSecret         TLSSecret
+	Sni               string
 	Params            map[string]string
 
 	Description                  string
@@ -94,6 +95,7 @@ func (t *Target) Equal(other *Target) bool {
 		t.CredentialsSecret == other.CredentialsSecret &&
 		t.TLSSecret == other.TLSSecret &&
 		t.LogService == other.LogService &&
+		t.Sni == other.Sni &&
 		maps.Equal(t.Params, other.Params)
 }
 
@@ -238,10 +240,11 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 		t.stop = func() {}
 
 	case TargetTypeMongodb:
-		collector := mongo.New(
+		collector, err := mongo.New(
 			t.Addr,
 			credentials.Username,
 			credentials.Password,
+			t.Sni,
 			tlsCreds,
 			t.Params,
 			scrapeInterval,
@@ -252,6 +255,9 @@ func (t *Target) StartExporter(reg *prometheus.Registry, credentials Credentials
 			maxTablesPerDB,
 			trackSizes,
 		)
+		if err != nil {
+			return err
+		}
 		t.setCollector(collector)
 		t.stop = func() { _ = collector.Close() }
 
@@ -290,6 +296,7 @@ func TargetFromConfig(i config.ApplicationInstrumentation) *Target {
 			Username: i.Credentials.Username,
 			Password: i.Credentials.Password,
 		},
+		Sni:         i.Sni,
 		Params:      i.Params,
 		Description: i.Instance,
 	}
