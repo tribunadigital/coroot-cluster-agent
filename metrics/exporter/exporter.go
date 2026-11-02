@@ -41,6 +41,7 @@ type Config struct {
 	Addr        string
 	Credentials Credentials
 	TLS         common.TLSCredentials
+	Sni         string
 	Params      map[string]string
 	Description string
 	LogService  string
@@ -181,10 +182,11 @@ func New(cfg Config, opts Options, logger logger.Logger) (*Exporter, error) {
 		return &Exporter{Collector: collector}, nil
 
 	case TypeMongodb:
-		collector := mongo.New(
+		collector, err := mongo.New(
 			cfg.Addr,
 			cfg.Credentials.Username,
 			cfg.Credentials.Password,
+			cfg.Sni,
 			cfg.TLS,
 			cfg.Params,
 			opts.ScrapeInterval,
@@ -195,6 +197,9 @@ func New(cfg Config, opts Options, logger logger.Logger) (*Exporter, error) {
 			opts.MaxTablesPerDB,
 			opts.TrackSizes,
 		)
+		if err != nil {
+			return nil, err
+		}
 		return &Exporter{Collector: collector, close: func() { _ = collector.Close() }}, nil
 
 	case TypeMemcached:
